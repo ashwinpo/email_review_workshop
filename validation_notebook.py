@@ -23,13 +23,24 @@ import json
 from pyspark.sql.functions import udf, col, struct, lit, when, size, array, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, BooleanType, ArrayType, IntegerType
 
-# Configuration
+# ============================================================================
+# Configuration - Update these values for your environment
+# ============================================================================
 CATALOG = "main"
 SCHEMA = "scotts_genai_workshop"
+AGENT_ENDPOINT = "kie-4cb95ce7-endpoint"  # Your Agent Bricks endpoint name
+
+# Table names
+INPUT_TABLE = "synthetic_emails"  # Input email data
+SAP_CUSTOMERS_TABLE = "sap_customers"  # Mock SAP customer database
+REVIEW_QUEUE_TABLE = "review_queue"  # Output review queue
+
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql(f"USE SCHEMA {SCHEMA}")
 
 print(f"✅ Using: {CATALOG}.{SCHEMA}")
+print(f"✅ Agent Endpoint: {AGENT_ENDPOINT}")
+print(f"✅ Tables: {INPUT_TABLE} → {REVIEW_QUEUE_TABLE}")
 
 # COMMAND ----------
 
@@ -43,18 +54,18 @@ print(f"✅ Using: {CATALOG}.{SCHEMA}")
 # Load extracted data from Agent Bricks
 # This assumes you've already run the extraction and stored results
 # Note: response.result is a VARIANT type, so we use : accessor syntax
-extracted_df = spark.sql("""
+extracted_df = spark.sql(f"""
   WITH query_results AS (
     SELECT 
       email_id,
       sender,
       `body` AS email_body,
       ai_query(
-        'kie-4cb95ce7-endpoint',
+        '{AGENT_ENDPOINT}',
         `body`,
         failOnError => false
       ) AS response
-    FROM synthetic_emails
+    FROM {INPUT_TABLE}
     LIMIT 50
   )
   SELECT
@@ -251,10 +262,10 @@ display(validated_df)
 # COMMAND ----------
 
 # Drop and recreate the table to ensure schema matches
-spark.sql("DROP TABLE IF EXISTS sap_customers")
+spark.sql(f"DROP TABLE IF EXISTS {SAP_CUSTOMERS_TABLE}")
 
-spark.sql("""
-  CREATE TABLE sap_customers (
+spark.sql(f"""
+  CREATE TABLE {SAP_CUSTOMERS_TABLE} (
     sap_id STRING,
     account_status STRING,
     last_updated TIMESTAMP
@@ -262,159 +273,33 @@ spark.sql("""
 """)
 
 # Populate with valid SAP IDs from our synthetic emails
-spark.sql("""
-  INSERT INTO sap_customers
+spark.sql(f"""
+  INSERT INTO {SAP_CUSTOMERS_TABLE}
   SELECT DISTINCT
     UPPER(sap_id) AS sap_id,
     'ACTIVE' AS account_status,
     current_timestamp() AS last_updated
-  FROM synthetic_emails
+  FROM {INPUT_TABLE}
   WHERE sap_id IS NOT NULL
 """)
 
-print(f"✅ Mock SAP database has {spark.table('sap_customers').count()} active accounts")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### MCP Integration (Optional)
-# MAGIC Use MCP SAP server for sap_exists check instead of table lookup
-
-# COMMAND ----------
-
-# Configuration for MCP
-import os
-USE_MCP_FOR_SAP = os.getenv("USE_MCP_FOR_SAP", "false").lower() == "true"
-MCP_SAP_URL = os.getenv("MCP_SAP_URL", "http://localhost:8000")
-
-print(f"MCP Integration: {'✅ Enabled' if USE_MCP_FOR_SAP else '❌ Disabled'}")
-if USE_MCP_FOR_SAP:
-    print(f"MCP URL: {MCP_SAP_URL}")
-
-# COMMAND ----------
-
-def check_sap_via_mcp(sap_ids_list):
-    """
-    Check SAP IDs via MCP bulk endpoint using databricks-mcp client
-    Returns dict mapping sap_id -> exists (bool)
-    """
-    if not USE_MCP_FOR_SAP:
-        return {}
-    
-    try:
-        import json
-        from databricks_mcp import DatabricksMCPClient
-        from databricks.sdk import WorkspaceClient
-        
-        # Normalize server URL
-        server_url = MCP_SAP_URL if MCP_SAP_URL.endswith('/') else f"{MCP_SAP_URL}/"
-        if not server_url.endswith('/mcp/'):
-            server_url = f"{server_url}mcp/" if not server_url.endswith('mcp/') else server_url
-        
-        # Check if local or remote
-        is_local = 'localhost' in server_url or '127.0.0.1' in server_url
-        
-        if is_local:
-            # For local testing
-            workspace_client = WorkspaceClient(
-                host="https://localhost",
-                token="local-dev-token"
-            )
-        else:
-            # For Databricks Apps
-            workspace_client = WorkspaceClient()
-        
-        mcp_client = DatabricksMCPClient(
-            server_url=server_url,
-            workspace_client=workspace_client
-        )
-        
-        # Process in chunks to avoid timeout
-        chunk_size = 200
-        results_map = {}
-        
-        for i in range(0, len(sap_ids_list), chunk_size):
-            chunk = sap_ids_list[i:i+chunk_size]
-            
-            # Call MCP tool
-            result_obj = mcp_client.call_tool(
-                "sap_bulk_check_exists",
-                arguments={"sap_ids": chunk}
-            )
-            
-            # Extract JSON from CallToolResult
-            if hasattr(result_obj, 'content') and result_obj.content:
-                for item in result_obj.content:
-                    if hasattr(item, 'text'):
-                        result = json.loads(item.text)
-                        for res_item in result.get("results", []):
-                            results_map[res_item["sap_id"]] = res_item["exists"]
-                        break
-            else:
-                print(f"⚠️ MCP no response for chunk {i//chunk_size}")
-                for sap_id in chunk:
-                    results_map[sap_id] = False
-        
-        print(f"✅ MCP checked {len(results_map)} SAP IDs: {sum(results_map.values())} found")
-        return results_map
-    
-    except Exception as e:
-        print(f"❌ MCP check failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        print("Falling back to table lookup")
-        return {}
+print(f"✅ Mock SAP database has {spark.table(SAP_CUSTOMERS_TABLE).count()} active accounts")
 
 # COMMAND ----------
 
 # Join with SAP customers to check existence
-# Use MCP if enabled, otherwise use table lookup
-sap_customers_df = spark.table("sap_customers")
+sap_customers_df = spark.table(SAP_CUSTOMERS_TABLE)
 
-if USE_MCP_FOR_SAP:
-    # Collect unique SAP IDs to check
-    sap_ids_to_check = [row.normalized_sap_id for row in validated_df.select("normalized_sap_id").distinct().collect() if row.normalized_sap_id]
-    
-    # Check via MCP
-    mcp_results = check_sap_via_mcp(sap_ids_to_check)
-    
-    if mcp_results:
-        # Convert MCP results to DataFrame
-        from pyspark.sql import Row
-        mcp_df = spark.createDataFrame([Row(sap_id=k, mcp_exists=v) for k, v in mcp_results.items()])
-        
-        # Join with validated data
-        validated_with_lookup_df = validated_df.join(
-            mcp_df,
-            validated_df.normalized_sap_id == mcp_df.sap_id,
-            "left"
-        ).select(
-            validated_df["*"],
-            when(mcp_df.mcp_exists.isNotNull(), mcp_df.mcp_exists).otherwise(False).alias("sap_exists")
-        )
-        print("✅ Using MCP for SAP existence check")
-    else:
-        # Fallback to table lookup
-        print("⚠️ MCP failed or returned empty, using table lookup")
-        validated_with_lookup_df = validated_df.join(
-            sap_customers_df,
-            validated_df.normalized_sap_id == sap_customers_df.sap_id,
-            "left"
-        ).select(
-            validated_df["*"],
-            when(sap_customers_df.sap_id.isNotNull(), True).otherwise(False).alias("sap_exists")
-        )
-else:
-    # Standard table lookup
-    validated_with_lookup_df = validated_df.join(
-        sap_customers_df,
-        validated_df.normalized_sap_id == sap_customers_df.sap_id,
-        "left"
-    ).select(
-        validated_df["*"],
-        when(sap_customers_df.sap_id.isNotNull(), True).otherwise(False).alias("sap_exists")
-    )
-    print("✅ Using table lookup for SAP existence check")
+# Standard table lookup
+validated_with_lookup_df = validated_df.join(
+    sap_customers_df,
+    validated_df.normalized_sap_id == sap_customers_df.sap_id,
+    "left"
+).select(
+    validated_df["*"],
+    when(sap_customers_df.sap_id.isNotNull(), True).otherwise(False).alias("sap_exists")
+)
+print("✅ Using table lookup for SAP existence check")
 
 display(validated_with_lookup_df)
 
@@ -504,7 +389,7 @@ review_queue_df = final_df.select(
 )
 
 # Write to table
-review_queue_df.write.mode("overwrite").saveAsTable("review_queue")
+review_queue_df.write.mode("overwrite").saveAsTable(REVIEW_QUEUE_TABLE)
 
 print(f"✅ Review queue created with {review_queue_df.count()} records")
 
@@ -516,7 +401,7 @@ print(f"✅ Review queue created with {review_queue_df.count()} records")
 # COMMAND ----------
 
 # Show items that need human review
-needs_review_df = spark.sql("""
+needs_review_df = spark.sql(f"""
   SELECT 
     email_id,
     validation_status,
@@ -529,7 +414,7 @@ needs_review_df = spark.sql("""
     normalized_name,
     normalized_phone,
     errors
-  FROM review_queue
+  FROM {REVIEW_QUEUE_TABLE}
   WHERE queue_type IN ('detailed_review', 'rejected')
   ORDER BY validation_status, email_id
 """)
@@ -544,7 +429,7 @@ display(needs_review_df)
 # COMMAND ----------
 
 # Show items that passed validation
-auto_approve_df = spark.sql("""
+auto_approve_df = spark.sql(f"""
   SELECT 
     email_id,
     validation_status,
@@ -553,7 +438,7 @@ auto_approve_df = spark.sql("""
     normalized_phone AS contact_phone,
     contact_email,
     queued_at
-  FROM review_queue
+  FROM {REVIEW_QUEUE_TABLE}
   WHERE queue_type = 'quick_approval'
   ORDER BY email_id
 """)
@@ -582,4 +467,4 @@ display(auto_approve_df)
 # MAGIC - **Part 3**: Human-in-the-loop review process
 # MAGIC - **Part 4**: Action execution (write approved changes to Delta/SAP)
 # MAGIC - **Part 5**: Orchestration with Databricks Workflows
-
+# MAGIC
